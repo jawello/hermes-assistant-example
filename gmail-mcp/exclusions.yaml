@@ -1,0 +1,12 @@
+# Senders the pipeline must never touch. Nothing about a matching message
+# leaves the VPS — not the body, not the subject, not the sender.
+#
+# This ships in the image, so a change goes through review and deploy like the
+# rest of config-as-code. For a one-off, apply the Gmail label `assistant/skip`
+# instead: it takes effect on the next poll with no deploy.
+#
+# `senders` matches one exact address. `domains` matches the domain and its
+# subdomains — "clinic.example" covers "mail.clinic.example" but not
+# "notclinic.example".
+senders: []
+domains: []

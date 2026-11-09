@@ -1,0 +1,7 @@
+patches/test_*.py
+patches/__pycache__
+patches/fixtures
+send_gate/tests
+send_gate/__pycache__
+history_search/tests
+history_search/__pycache__

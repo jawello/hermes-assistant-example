@@ -1,0 +1,10 @@
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+*.egg-info
+tests
+.git
+# A live refresh token if `python -m gmail_mcp.auth` was ever run from here —
+# must never end up baked into an image layer via `COPY . /opt/gmail-mcp`.
+gmail-refresh-token.txt

@@ -1,0 +1,322 @@
+#!/usr/bin/env python3
+"""The ledger of tasks the morning job suggests to the user.
+
+The cron run that proposes tasks and the chat session where the user answers
+"да 1, 3" share no context: the chat agent never saw the cron output. So what
+was proposed lives here, in $HERMES_HOME/suggestions/ledger.jsonl, one JSON
+object per line, and both sides go through this command. The model never edits
+the file by hand.
+
+Usage:
+    suggestions add --title "..." --why "..." --source "письмо от X, 18.09" [--due 2026-10-10]
+    suggestions list [--pending] [--date 2026-09-21]
+    suggestions set-status s-2026-09-21-1 accepted|rejected|done
+    suggestions message
+    suggestions context [--api-url URL] [--bank ID] [--timeout N]
+"""
+import argparse
+import fcntl
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+from contextlib import contextmanager
+from datetime import date, datetime, timedelta
+from pathlib import Path
+
+EXPIRE_AFTER_DAYS = 7
+# accepted: a TickTick task was made for it; done: the user acted on it himself
+# and wanted no task; rejected: not useful. None of them is proposed again.
+FINAL_STATUSES = ("accepted", "rejected", "done")
+
+
+def hermes_home() -> Path:
+    return Path(os.environ.get("HERMES_HOME", "/data/hermes"))
+
+
+def ledger_path() -> Path:
+    return hermes_home() / "suggestions" / "ledger.jsonl"
+
+
+def today() -> date:
+    override = os.environ.get("SUGGESTIONS_TODAY")
+    return date.fromisoformat(override) if override else date.today()
+
+
+def read_items(path: Path) -> list:
+    """Entries in file order. A line that is not a suggestion stays in the list
+    as its raw text, so the next rewrite keeps it instead of dropping it."""
+    items = []
+    if not path.exists():
+        return items
+    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            entry = None
+        if isinstance(entry, dict) and "id" in entry and "status" in entry and "date" in entry:
+            items.append(entry)
+        else:
+            print(f"ledger line {number} is not a suggestion, left as is", file=sys.stderr)
+            items.append(line)
+    return items
+
+
+def write_items(path: Path, items: list) -> None:
+    tmp = path.with_suffix(".tmp")
+    with tmp.open("w", encoding="utf-8") as out:
+        for item in items:
+            out.write(item if isinstance(item, str) else json.dumps(item, ensure_ascii=False))
+            out.write("\n")
+    os.replace(tmp, path)
+
+
+def expire(items: list, now: date) -> None:
+    for item in items:
+        if isinstance(item, dict) and item["status"] == "pending":
+            if (now - date.fromisoformat(item["date"])).days > EXPIRE_AFTER_DAYS:
+                item["status"] = "expired"
+
+
+@contextmanager
+def ledger():
+    """The ledger's entries, expired as of today, written back on exit. The
+    lock keeps the morning run and a chat reply from interleaving writes."""
+    path = ledger_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path.parent / ".lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        items = read_items(path)
+        expire(items, today())
+        yield items
+        write_items(path, items)
+
+
+def entries(items: list) -> list[dict]:
+    return [item for item in items if isinstance(item, dict)]
+
+
+def format_entry(entry: dict) -> str:
+    return (f"{entry['id']}\t{entry['status']}\t{entry['title']}\t"
+            f"due {entry.get('due') or '-'}\t{entry['why']} ({entry['source']})")
+
+
+def non_empty(value: str) -> str:
+    value = value.strip()
+    if not value:
+        raise argparse.ArgumentTypeError("must not be empty")
+    return value
+
+
+def iso_date(value: str) -> str:
+    try:
+        return date.fromisoformat(value).isoformat()
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a YYYY-MM-DD date: {value}")
+
+
+def cmd_add(args) -> int:
+    with ledger() as items:
+        day = today().isoformat()
+        number = 1 + sum(1 for e in entries(items) if e["date"] == day)
+        entry = {"id": f"s-{day}-{number}", "date": day, "title": args.title,
+                 "why": args.why, "source": args.source, "due": args.due,
+                 "status": "pending"}
+        items.append(entry)
+    print(f"{number}\t{entry['id']}")
+    return 0
+
+
+def cmd_list(args) -> int:
+    with ledger() as items:
+        selected = [e for e in entries(items)
+                    if (not args.pending or e["status"] == "pending")
+                    and (not args.date or e["date"] == args.date)]
+    for entry in selected:
+        print(format_entry(entry))
+    return 0
+
+
+def cmd_set_status(args) -> int:
+    with ledger() as items:
+        match = next((e for e in entries(items) if e["id"] == args.id), None)
+        if match is None:
+            print(f"no suggestion {args.id}", file=sys.stderr)
+            return 1
+        if match["status"] != "pending":
+            print(f"{args.id} is already {match['status']}", file=sys.stderr)
+            return 1
+        match["status"] = args.status
+    print(f"{args.id} {args.status}")
+    return 0
+
+
+def number_of(entry: dict) -> int:
+    return int(entry["id"].rsplit("-", 1)[1])
+
+
+def reply_hint(numbers: list[int]) -> str:
+    """The reply line, with numbers taken from the batch itself: the model
+    once copied the skill's example and offered «да 1, 3» for two items."""
+    if len(numbers) == 1:
+        return "Ответь «да», «нет», «сделано» или «на пятницу»."
+    first, last = numbers[0], numbers[-1]
+    return f"Ответь «да {first}, {last}», «нет», «сделано {last}» или «{first} — на пятницу»."
+
+
+def cmd_message(args) -> int:
+    """Today's pending suggestions as the message the morning run sends."""
+    day = today().isoformat()
+    with ledger() as items:
+        batch = sorted((e for e in entries(items) if e["date"] == day and e["status"] == "pending"),
+                       key=number_of)
+    if not batch:
+        print(f"no pending suggestions for {day}", file=sys.stderr)
+        return 1
+    print("Предложение на сегодня:" if len(batch) == 1 else "Предложения на сегодня:")
+    for entry in batch:
+        print(f"{number_of(entry)}. {entry['title']}")
+        print(f"   {entry['why']} — {entry['source']}")
+    print(reply_hint([number_of(e) for e in batch]))
+    return 0
+
+
+RECENT_DAYS = 7
+# How long an accepted/expired entry stays in the context ledger section.
+# Pending entries are always shown, and so is a rejected one, at any age —
+# a rejected idea must never be re-proposed, so the morning run has to keep
+# seeing it.
+ACCEPTED_OR_EXPIRED_HISTORY_DAYS = 30
+DATED_QUERY = "upcoming deadlines, renewals, appointments, deliveries, payments due"
+RECENT_QUERY = "what the user learned, planned or was told recently"
+
+
+def load_endpoint(api_url: str | None, bank: str | None) -> tuple[str, str]:
+    """Where memory lives: flags, then env, then the hindsight provider's own
+    config — the same order `remember` uses, so the two cannot disagree."""
+    config_path = hermes_home() / "hindsight" / "config.json"
+    config = {}
+    if config_path.is_file():
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            config = {}
+    url = api_url or os.environ.get("HINDSIGHT_API_URL") or config.get("api_url")
+    bank_id = bank or os.environ.get("HINDSIGHT_BANK_ID") or config.get("bank_id")
+    if not url or not bank_id:
+        raise RuntimeError(f"no api_url/bank_id in {config_path}")
+    return url.rstrip("/"), bank_id
+
+
+def recall(url: str, bank: str, query: str, timeout: int) -> list[dict]:
+    request = urllib.request.Request(
+        f"{url}/v1/default/banks/{bank}/memories/recall",
+        data=json.dumps({"query": query, "max_tokens": 2048, "budget": "mid"}).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        body = json.loads(response.read().decode("utf-8"))
+    results = body.get("results") if isinstance(body, dict) else None
+    if results is None:
+        results = []
+    if not isinstance(results, list) or not all(isinstance(item, dict) for item in results):
+        # Turned into the same clean "could not read memory" exit as a
+        # network failure, instead of an uncaught AttributeError/TypeError
+        # from format_fact() further down.
+        raise ValueError(f"malformed recall response from {url}")
+    return results
+
+
+def fact_day(value: str | None) -> date | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value).date()
+    except ValueError:
+        return None
+
+
+def format_fact(fact: dict) -> str:
+    when = fact_day(fact.get("occurred_start"))
+    return f"- {when.isoformat() if when else 'undated'}: {fact.get('text', '').strip()}"
+
+
+def cmd_context(args) -> int:
+    now = today()
+    with ledger() as items:
+        recent = [e for e in entries(items)
+                  if e["status"] in ("pending", "rejected")
+                  or (now - date.fromisoformat(e["date"])).days <= ACCEPTED_OR_EXPIRED_HISTORY_DAYS]
+    print("## Ledger (already proposed; do not propose these again)")
+    for entry in recent:
+        print(format_entry(entry))
+    if not recent:
+        print("(empty)")
+
+    try:
+        url, bank = load_endpoint(args.api_url, args.bank)
+        dated = recall(url, bank, DATED_QUERY, args.timeout)
+        latest = recall(url, bank, RECENT_QUERY, args.timeout)
+    except (RuntimeError, urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
+        # The facts are private, but these messages never carry any of
+        # them — connection/timeout/parse errors and our own malformed-
+        # response text — so printing {exc} in full is safe.
+        print(f"\ncould not read memory: {type(exc).__name__}: {exc}")
+        return 1
+
+    since = now - timedelta(days=RECENT_DAYS)
+    print("\n## Memory: dated items")
+    for fact in dated:
+        print(format_fact(fact))
+    print("\n## Memory: last 7 days")
+    for fact in latest:
+        retained = fact_day(fact.get("mentioned_at"))
+        if retained is None or retained >= since:
+            print(format_fact(fact))
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="The ledger of suggested tasks.")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    add = sub.add_parser("add", help="record one suggestion as pending")
+    add.add_argument("--title", required=True, type=non_empty)
+    add.add_argument("--why", required=True, type=non_empty)
+    add.add_argument("--source", required=True, type=non_empty)
+    add.add_argument("--due", type=iso_date)
+    add.set_defaults(func=cmd_add)
+
+    lst = sub.add_parser("list", help="show suggestions")
+    lst.add_argument("--pending", action="store_true")
+    lst.add_argument("--date", type=iso_date)
+    lst.set_defaults(func=cmd_list)
+
+    status = sub.add_parser("set-status", help="settle a pending suggestion")
+    status.add_argument("id")
+    status.add_argument("status", choices=FINAL_STATUSES)
+    status.set_defaults(func=cmd_set_status)
+
+    message = sub.add_parser("message", help="print today's pending suggestions as the message to send")
+    message.set_defaults(func=cmd_message)
+
+    context = sub.add_parser("context", help="print the ledger and memory for the morning job")
+    context.add_argument("--api-url", help="override the hindsight endpoint")
+    context.add_argument("--bank", help="override the bank id")
+    context.add_argument("--timeout", type=int, default=120)
+    context.set_defaults(func=cmd_context)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

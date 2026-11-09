@@ -1,0 +1,29 @@
+[project]
+name = "login-broker"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    # mcp 2 renamed FastMCP to mcp.server.mcpserver.MCPServer; servers are
+    # written against it. <3 keeps the next major from arriving on a rebuild.
+    "mcp>=2.3,<3",
+    "playwright>=1.45",
+    "pyotp>=2.9",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest-asyncio>=0.24",
+]
+
+[project.scripts]
+login-broker = "login_broker.server:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["login_broker*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

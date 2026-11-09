@@ -1,0 +1,459 @@
+name: personal-assistant
+
+services:
+  hermes:
+    build:
+      context: .
+      dockerfile: hermes/Dockerfile
+    image: assistant/hermes:latest
+    restart: unless-stopped
+    # hermes 0.21 spawns workers (kanban, terminal tools) and warns that as
+    # PID 1 it cannot reap their orphans; docker's tini does it instead.
+    init: true
+    depends_on:
+      - login-broker
+      - hindsight
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY}
+      GROQ_API_KEY: ${GROQ_API_KEY}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      TELEGRAM_ALLOWED_USERS: ${TELEGRAM_ALLOWED_USERS}
+      TICKTICK_API_TOKEN: ${TICKTICK_API_TOKEN}
+      # Optional until the user provisions the token in secrets.sops.yaml; the
+      # default-empty keeps compose quiet and hermes must boot without it.
+      ZENMONEY_TOKEN: ${ZENMONEY_TOKEN:-}
+      # HMAC secret for the webhook alice-bridge posts voice commands to.
+      # Empty keeps the webhook platform off.
+      ALICE_WEBHOOK_SECRET: ${ALICE_WEBHOOK_SECRET:-}
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - default
+      - aibrowse
+      - memnet
+      - telegram
+    pids_limit: 512
+    mem_limit: 2g
+    volumes:
+      - hermes_state:/data/hermes
+      # Files handed to other containers (mail attachments): see shared-janitor.
+      - shared_files:/shared
+    healthcheck:
+      test: ["CMD", "pgrep", "-f", "hermes gateway"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+      start_interval: 2s
+
+  # Hindsight memory API (knowledge graph engine), backed by hindsight-db above.
+  # Runs as a non-root user. hermes reaches it by name over `memnet`; it also
+  # needs egress (`default`) to call the Portal extractor and to fetch the
+  # tiktoken encoding + embeddings model on first boot (cached on the volume
+  # afterwards). No host ports are published. First boot is slow (model
+  # download), hence the long start_period.
+  # Standard PostgreSQL (with pgvector) backing the Hindsight graph. Replaces
+  # Hindsight's bundled pg0, which was flaky under a docker volume. Runs as the
+  # image's non-root postgres user; internal memnet only, no host ports.
+  hindsight-db:
+    image: pgvector/pgvector:pg17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: hindsight
+      POSTGRES_PASSWORD: ${HINDSIGHT_DB_PASSWORD}
+      POSTGRES_DB: hindsight
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 512m
+    networks:
+      - memnet
+    volumes:
+      - hindsight_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hindsight -d hindsight"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+      start_interval: 2s
+
+  hindsight:
+    build:
+      context: .
+      dockerfile: hindsight/Dockerfile
+    image: assistant/hindsight:latest
+    restart: unless-stopped
+    depends_on:
+      hindsight-db:
+        condition: service_healthy
+    environment:
+      HINDSIGHT_API_DATABASE_URL: postgresql://hindsight:${HINDSIGHT_DB_PASSWORD}@hindsight-db:5432/hindsight
+      HINDSIGHT_API_LLM_API_KEY: ${HINDSIGHT_LLM_API_KEY}
+      HINDSIGHT_API_LLM_PROVIDER: openai
+      HINDSIGHT_API_LLM_MODEL: openai/gpt-6-luna
+      HINDSIGHT_API_LLM_BASE_URL: https://inference-api.nousresearch.com/v1
+      # Recall spent 32 of its 32.5 s in the local cross-encoder scoring 300
+      # candidates on 2 CPUs (2026-10-11), at any budget. The 4096-token answer
+      # keeps ~45 facts, so reranking the top 60 of the fused list still picks
+      # them; a standalone run put 60 at ~6 s.
+      HINDSIGHT_API_RERANKER_MAX_CANDIDATES: "60"
+      # The default reranker is English and text search does not stem Russian.
+      # HINDSIGHT_RERANKER_ONNX_FILE comes from hindsight/patches/reranker_onnx.py.
+      # The batch size, bucket batching and single rerank keep the int8 model under
+      # mem_limit: with the default batch of 32 it was OOM-killed (2026-11-03).
+      # Text search language applies to new rows; changing it needs the backfill in
+      HINDSIGHT_API_TEXT_SEARCH_EXTENSION_NATIVE_LANGUAGE: russian
+      HINDSIGHT_API_RERANKER_LOCAL_MODEL: cross-encoder/mmarco-mMiniLMv2-L12-H384-v1
+      HINDSIGHT_RERANKER_ONNX_FILE: onnx/model_quint8_avx2.onnx
+      HINDSIGHT_API_RERANKER_LOCAL_BATCH_SIZE: "8"
+      HINDSIGHT_API_RERANKER_LOCAL_BUCKET_BATCHING: "true"
+      HINDSIGHT_API_RERANKER_LOCAL_MAX_CONCURRENT: "1"
+      # The default embedding model is English. Upstream refuses a new dimension on a
+      # table with data, so changing this needs ops/hindsight-change-embedding.sh first.
+      HINDSIGHT_API_EMBEDDINGS_LOCAL_MODEL: cointegrated/rubert-tiny2
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    # About 1140 MiB anonymous memory at rest and a 1353 MiB peak over 18 live hours
+    # (2026-11-04: app + worker + embeddings + int8 reranker). Capped so a memory spike
+    # OOM-kills this service, never the assistant. Watch on vps-1; move to a
+    # dedicated host if it proves tight.
+    mem_limit: 1536m
+    networks:
+      - memnet    # private link to hermes
+      - default   # egress: Portal extractor + first-boot model/tiktoken downloads
+    volumes:
+      # Model/tiktoken cache (~/.cache) + logs (~/.hindsight) under the non-root
+      # home, so models aren't re-downloaded on every boot. The memory graph
+      # itself lives in hindsight-db, not here.
+      - hindsight_data:/home/hs
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8888/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      # Fresh-volume first boot downloads models + runs initdb; models then cache
+      # on the volume so later boots are quick.
+      start_period: 240s
+      start_interval: 2s
+
+  # One-shot: generate the self-signed TLS cert into vaultwarden_tls once, then
+  # exit. The modern Bitwarden web vault refuses to run over http even on
+  # localhost ("Insecure URL not allowed"), so the vault must serve HTTPS.
+  vault-cert-init:
+    image: alpine/openssl@sha256:0b22ba3ac61b6bcc56e34506f1b548281e46986d70e0e539c94a70452b283cff
+    entrypoint: ["/bin/sh"]
+    command:
+      - -c
+      - |
+        test -f /ssl/vw.crt && test -f /ssl/vw.key && { echo "cert exists"; exit 0; }
+        openssl req -x509 -newkey rsa:2048 -nodes \
+          -keyout /ssl/vw.key -out /ssl/vw.crt -days 3650 \
+          -subj "/CN=localhost" \
+          -addext "subjectAltName=DNS:localhost,DNS:vaultwarden,IP:127.0.0.1"
+        # 600 key: both this init and vaultwarden run as root (uid 0), so
+        # owner-only is readable by the consumer. Keep them same-UID.
+        chmod 600 /ssl/vw.key && chmod 644 /ssl/vw.crt && echo "cert generated"
+    volumes:
+      - vaultwarden_tls:/ssl
+
+  vaultwarden:
+    image: vaultwarden/server:1.37.3-alpine
+    restart: unless-stopped
+    depends_on:
+      vault-cert-init:
+        condition: service_completed_successfully
+    environment:
+      # Plain random token (not argon2 PHC: the $-laden PHC string does not
+      # survive .env round-tripping, and the service is loopback-only anyway).
+      ADMIN_TOKEN: ${VAULTWARDEN_ADMIN_TOKEN}
+      # Accounts are created via /admin invite only.
+      SIGNUPS_ALLOWED: "false"
+      INVITATIONS_ALLOWED: "true"
+      # HTTPS via the self-signed cert from vault-cert-init. Rocket serves TLS
+      # on the container port (80). Reached through an SSH tunnel straight to
+      # the container IP, so the browser still sees https://localhost:8222.
+      ROCKET_TLS: '{certs="/ssl/vw.crt",key="/ssl/vw.key"}'
+      DOMAIN: https://localhost:8222
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 256m
+    networks:
+      # Static IP instead of a host port: Docker never publishes ports of a
+      # container whose only network is internal, so `ports:` was a no-op.
+      # Access: ssh -L 8222:172.29.0.10:80 deploy@<host>.
+      vault:
+        ipv4_address: 172.29.0.10
+    volumes:
+      - vaultwarden_data:/data
+      - vaultwarden_tls:/ssl:ro
+    # Healthcheck comes from the image; it switches to https when ROCKET_TLS is set.
+
+  chromium:
+    image: chromedp/headless-shell:155.0.8059.26
+    restart: unless-stopped
+    # Flags are appended to the image's run.sh ($@). --disable-dev-shm-usage:
+    # the default 64 MB /dev/shm crashes renderers. --remote-allow-origins=*:
+    # Chrome >=111 rejects CDP websocket upgrades from non-allowlisted Origins.
+    # --user-data-dir: persist cookies on the volume across restarts.
+    # --window-size: headless-shell defaults to a tiny 800x600 window, which
+    # renders sites at their mobile/narrow breakpoint. That hides desktop-only
+    # login triggers and pushes modal submit buttons out of the clickable
+    # viewport, so browser_login times out clicking them (seen on
+    # example-shop.com). A normal desktop window makes those elements
+    # clickable and matches how the login forms are meant to be used.
+    command:
+      - --disable-dev-shm-usage
+      - --remote-allow-origins=*
+      - --user-data-dir=/data/chrome-profile
+      - --window-size=1280,800
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 1024
+    mem_limit: 1g
+    networks:
+      # Static IP: Hermes reaches CDP by IP because Chrome's DevTools HTTP
+      # endpoints reject a Host header that is a service name (only localhost
+      # or an IP is accepted). No host port — CDP stays internal.
+      aibrowse:
+        ipv4_address: 172.28.0.10
+    volumes:
+      - chromium_profile:/data/chrome-profile
+    healthcheck:
+      # Image has bash + /dev/tcp but no curl/wget. Verify Chrome actually
+      # answers /json/version, not just that the socat port is open.
+      test:
+        - CMD
+        - bash
+        - -c
+        - 'exec 3<>/dev/tcp/127.0.0.1/9222; printf "GET /json/version HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" >&3; grep -q webSocketDebuggerUrl <&3'
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+      start_interval: 2s
+
+  login-broker:
+    build:
+      context: login-broker
+      dockerfile: Dockerfile
+    image: assistant/login-broker:latest
+    restart: unless-stopped
+    depends_on:
+      - vaultwarden
+      - chromium
+    environment:
+      VAULTWARDEN_URL: https://vaultwarden:80
+      VAULTWARDEN_ACCOUNT_EMAIL: ai-browser@vault.local
+      BW_MASTER_PASSWORD: ${BW_MASTER_PASSWORD}
+      LOGIN_BROKER_CDP_URL: http://172.28.0.10:9222
+      NODE_EXTRA_CA_CERTS: /ssl/vw.crt
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    mem_limit: 1g
+    networks:
+      - vault
+      - aibrowse
+      - default
+    volumes:
+      - vaultwarden_tls:/ssl:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('localhost',8000),2)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+      start_interval: 2s
+  # Gmail tools for the agent. Only this service receives the Google
+  # credentials — hermes never does.
+  gmail-mcp:
+    build:
+      context: gmail-mcp
+      dockerfile: Dockerfile
+    image: assistant/gmail-mcp:latest
+    restart: unless-stopped
+    environment:
+      GMAIL_CLIENT_ID: ${GMAIL_CLIENT_ID}
+      GMAIL_CLIENT_SECRET: ${GMAIL_CLIENT_SECRET}
+      GMAIL_REFRESH_TOKEN: ${GMAIL_REFRESH_TOKEN}
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    mem_limit: 512m
+    volumes:
+      # Attachments: saved under /shared/mail/, attached from anywhere in /shared.
+      - shared_files:/shared
+    networks:
+      - default
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('localhost',8000),2)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+      start_interval: 2s
+
+  # Empties /shared, the folder containers hand files through (hermes and
+  # gmail-mcp: mail attachments; telegram-mcp: downloaded media). Files older
+  # than 7 days go, then emptied per-message folders; /shared/outbox,
+  # /shared/mail and /shared/telegram stay. The volume is transient and stays
+  # out of ops/backup.sh. It also makes /shared/telegram, the one folder
+  # telegram-mcp (uid 10001) may write to.
+  shared-janitor:
+    image: busybox:1.37.0@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e
+    restart: unless-stopped
+    init: true
+    network_mode: none
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 16
+    mem_limit: 16m
+    volumes:
+      - shared_files:/shared
+    command:
+      - sh
+      - -c
+      - |
+        mkdir -p /shared/telegram && chown 10001:10001 /shared/telegram
+        while :; do
+          find /shared -mindepth 1 -type f -mtime +6 -delete
+          find /shared -mindepth 2 -type d -empty -delete
+          sleep 3600
+        done
+
+  # the user's own Telegram account (a user login, not a bot). Only this
+  # container holds the session — full access to the account. It serves the
+  # read-only tools (digest, questions) and one gated write path: our
+  # send_gate module, which sends only to allowlisted chats and only after
+  # the user accepts each message on a button. Upstream's own write tools are
+  # dropped before the server starts serving.
+  telegram-mcp:
+    build:
+      context: telegram-mcp
+      dockerfile: Dockerfile
+    image: assistant/telegram-mcp:latest
+    restart: unless-stopped
+    # run.sh sleeps between retries; an init forwards the stop signal to it.
+    init: true
+    environment:
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH}
+      TELEGRAM_SESSION_STRING: ${TELEGRAM_SESSION_STRING}
+      # Refuses to start under any other account.
+      TELEGRAM_EXPECTED_USERNAME: ${TELEGRAM_EXPECTED_USERNAME}
+      # read-only tools + the send gate's write tools (list_allowed_chats is
+      # read-only and passes by itself) + set_contact_alias, which only writes
+      # the alias file in /data/state (what the user calls someone, saved on his
+      # answer) + download_media, which writes a message's photo or file to
+      # /shared/telegram (a photo for a task). An unknown name stops the server.
+      TELEGRAM_EXPOSED_TOOLS: read-only+send_message_confirmed,allow_chat,disallow_chat,set_contact_alias,download_media
+      # download_media writes here and nowhere else, without asking hermes
+      # for MCP roots. Design:
+      TELEGRAM_ALLOWED_ROOTS: /shared/telegram
+      TELEGRAM_SERVER_ROOTS_ONLY: "true"
+      # Voice notes are transcribed when listed, so they reach the digest.
+      # Groq is the engine hermes already uses for voice input.
+      TELEGRAM_TRANSCRIBE: auto
+      TELEGRAM_TRANSCRIBE_ENGINE: groq
+      # Up to five voice notes are transcribed inside one list_messages call;
+      # the upstream 55 s limit timed out on the first pass. hermes waits 300 s.
+      TELEGRAM_TOOL_TIMEOUT_SECONDS: "240"
+      GROQ_API_KEY: ${GROQ_API_KEY}
+      MCP_ALLOWED_HOSTS: telegram-mcp:8000
+    volumes:
+      - telegram_state:/data
+      # Files the send gate sends (send_message_confirmed files=[...]): hermes
+      # copies them into /shared/outbox/, mail attachments are under
+      # /shared/mail/. Writable, but the server runs as uid 10001 and every
+      # folder here is root's except /shared/telegram (download_media).
+      - shared_files:/shared
+    depends_on:
+      # Creates /shared/telegram for uid 10001; without it the server
+      # refuses to start (TELEGRAM_ALLOWED_ROOTS).
+      shared-janitor:
+        condition: service_started
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 512m
+    # Its own network, shared only with hermes: the server has no auth, so
+    # any container that reached it could read the whole account.
+    networks:
+      - telegram
+    healthcheck:
+      # Healthy when serving, or when run.sh parked it after a refused start
+      # (see telegram-mcp/run.sh): a broken session must not block deploys.
+      test: ["CMD", "python", "-c", "import os, socket; os.path.exists('/tmp/telegram-mcp-parked') or socket.create_connection(('localhost',8000),2)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+      start_interval: 2s
+
+  # Webhook of the private Alice skill «Агент Гермес». Answers Alice within
+  # its ~3 s limit and hands the phrase to hermes' webhook platform; the
+  # agent replies in Telegram. Public only through the edge Caddy (infra
+  # repo) at assistant.example/alice/<path secret>.
+  alice-bridge:
+    build:
+      context: alice-bridge
+      dockerfile: Dockerfile
+    image: assistant/alice-bridge:latest
+    # The edge Caddy resolves upstreams by container name.
+    container_name: alice-bridge
+    restart: unless-stopped
+    environment:
+      # All empty until the skill is registered: the bridge then rejects
+      # every request.
+      ALICE_PATH_SECRET: ${ALICE_PATH_SECRET:-}
+      ALICE_WEBHOOK_SECRET: ${ALICE_WEBHOOK_SECRET:-}
+      ALICE_SKILL_ID: ${ALICE_SKILL_ID:-}
+      ALICE_ALLOWED_USER_IDS: ${ALICE_ALLOWED_USER_IDS:-}
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 128m
+    networks:
+      - default
+      - edge
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+      start_interval: 2s
+
+
+networks:
+  default:
+  # Where a reverse proxy (TLS, a public URL for alice-bridge) would attach.
+  edge:
+  aibrowse:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+  vault:
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.29.0.0/24
+  # hermes ↔ hindsight memory service; internal only, never exposed.
+  memnet:
+    internal: true
+  # hermes ↔ telegram-mcp only. Not internal: the server needs Telegram and
+  # Groq on the internet.
+  telegram:
+volumes:
+  hermes_state:
+  hindsight_data:
+  hindsight_db_data:
+  vaultwarden_data:
+  vaultwarden_tls:
+  chromium_profile:
+  telegram_state:
+  shared_files:

@@ -1,0 +1,5 @@
+name: ticktick_untimed
+version: "1.0.0"
+description: "Send a TickTick date with no time as an all-day task, so it never lands at 00:00."
+provides_hooks:
+  - pre_tool_call

@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""Write one durable fact into the assistant's memory bank.
+
+This exists because hermes runs cron jobs with ``skip_memory=True``
+(cron/scheduler.py) — deliberately, so that scheduled system prompts cannot
+pollute the model's picture of the user. The side effect is that an agent
+running on a schedule has no memory tool at all: it gets
+"Memory is not available" and the fact is lost with a single WARNING in the
+log. That is exactly how the first Gmail digest read the mail and remembered
+none of it.
+
+So this calls the same retain endpoint the hindsight provider itself calls.
+A fact stored here is not a special kind of memory — it lands in the same
+bank, through the same API, as one stored during a conversation.
+
+Usage:
+    remember "Электричество 4200 ₽, оплатить до 25 сентября"
+    echo "..." | remember --context "gmail digest" --tag gmail
+"""
+import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+DEFAULT_TIMEOUT = 120
+
+
+def load_endpoint(api_url: str | None, bank: str | None) -> tuple[str, str]:
+    """Where to write. Explicit flags win, then env, then the provider's own
+    config file — so this cannot drift away from what hermes itself uses."""
+    config_path = Path(os.environ.get("HERMES_HOME", "/data/hermes")) / "hindsight" / "config.json"
+    config = {}
+    if config_path.is_file():
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            config = {}
+
+    url = api_url or os.environ.get("HINDSIGHT_API_URL") or config.get("api_url")
+    bank_id = bank or os.environ.get("HINDSIGHT_BANK_ID") or config.get("bank_id")
+    if not url or not bank_id:
+        raise SystemExit(
+            f"cannot tell where memory lives: no api_url/bank_id in {config_path}, "
+            "and none given via --api-url/--bank or HINDSIGHT_API_URL/HINDSIGHT_BANK_ID"
+        )
+    return url.rstrip("/"), bank_id
+
+
+def build_body(
+    content: str, context: str | None, tags: list[str], timestamp: str, document_id: str | None = None
+) -> dict:
+    item = {"content": content, "timestamp": timestamp}
+    if context:
+        item["context"] = context
+    # hindsight replaces a document it already holds under this id, so a fact
+    # stored again from the same source replaces itself instead of piling up.
+    if document_id:
+        item["document_id"] = document_id
+    if tags:
+        item["tags"] = tags
+    # async=False so a failure is reported to the caller instead of vanishing
+    # into a background queue. The whole point of this script is knowing
+    # whether the fact actually landed.
+    return {"items": [item], "async": False}
+
+
+def post(url: str, body: dict, timeout: int) -> str:
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return response.read().decode("utf-8", errors="replace")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Store one fact in the assistant's memory.")
+    parser.add_argument("content", nargs="?", help="the fact; read from stdin when omitted")
+    parser.add_argument("--context", help="where the fact came from, e.g. 'gmail digest'")
+    parser.add_argument("--tag", action="append", default=[], dest="tags")
+    parser.add_argument("--timestamp", help="ISO 8601; defaults to now (UTC)")
+    parser.add_argument(
+        "--document-id",
+        help="stable id of the fact's source, e.g. tg-<chat>-<message>-<n>; storing again replaces it",
+    )
+    parser.add_argument("--api-url", help="override the hindsight endpoint")
+    parser.add_argument("--bank", help="override the bank id")
+    parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
+    parser.add_argument("--dry-run", action="store_true", help="print the request body and exit")
+    args = parser.parse_args(argv)
+
+    content = args.content if args.content is not None else sys.stdin.read()
+    content = content.strip()
+    if not content:
+        parser.error("nothing to remember: give the fact as an argument or on stdin")
+
+    timestamp = args.timestamp or datetime.now(timezone.utc).isoformat()
+    body = build_body(content, args.context, args.tags, timestamp, args.document_id)
+
+    if args.dry_run:
+        print(json.dumps(body, ensure_ascii=False))
+        return 0
+
+    url, bank = load_endpoint(args.api_url, args.bank)
+    endpoint = f"{url}/v1/default/banks/{bank}/memories"
+    try:
+        post(endpoint, body, args.timeout)
+    except urllib.error.HTTPError as exc:
+        # The fact itself is never echoed back: it may be private, and this
+        # output goes into an agent transcript and a container log.
+        print(f"memory refused the write: HTTP {exc.code} from {endpoint}", file=sys.stderr)
+        return 1
+    except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        print(f"could not reach memory at {endpoint}: {type(exc).__name__}", file=sys.stderr)
+        return 1
+
+    print("saved")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

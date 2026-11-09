@@ -1,0 +1,10 @@
+{
+  "mode": "local_external",
+  "api_url": "http://hindsight:8888",
+  "bank_id": "hermes",
+  "recall_budget": "mid",
+  "recall_sync": true,
+  "recall_max_input_chars": 500,
+  "recall_max_tokens": 2500,
+  "prefetch_retain_drain_timeout": 30
+}

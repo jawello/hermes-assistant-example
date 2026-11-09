@@ -1,0 +1,12 @@
+.git
+.github
+.superpowers
+docs
+ops
+*.md
+.env
+.env.example
+secrets.sops.yaml
+.sops.yaml
+docker-compose.yml
+zenmoney-cli/.venv

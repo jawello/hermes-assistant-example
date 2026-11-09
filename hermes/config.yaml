@@ -1,0 +1,203 @@
+# Hermes config-as-code. The entrypoint copies this into $HERMES_HOME on every
+# start — edit here, not on the volume. ${VAR} values resolve from
+# $HERMES_HOME/.env, which the entrypoint generates from container env.
+#
+# This is an example: pick your own models, timezone and servers.
+
+# The schema version this file is written against (hermes-agent 0.21.5).
+# Without it hermes reads the file as version 0 and replays every migration
+# since; `hermes config check` shows when a newer hermes moves it on.
+_config_version: 46
+
+model:
+  # Any provider hermes supports. The live setup uses Nous Portal (provider
+  # `nous`, OAuth stored on the volume by `hermes login`, so no API key here);
+  # Portal model ids take no provider prefix.
+  provider: nous
+  default: "openai/gpt-6-sol"
+  # Compress before the price tier doubles: above 272K prompt tokens some
+  # routes charge double or cap the window.
+  context_length: 272000
+
+# When the main model is refused — plan limit, HTTP 402 on credits, rate
+# limit or outage — try a lighter model, then a free one, instead of not
+# answering.
+fallback_providers:
+  - provider: nous
+    model: "openai/gpt-6-luna"
+  - provider: nous
+    model: "stepfun/step-3.7-flash:free"
+
+memory:
+  # External memory provider: Hindsight in local_external mode — the graph +
+  # embedded PostgreSQL run in the separate non-root `hindsight` container (PG's
+  # initdb refuses to run as root, and hermes runs as root). hermes only holds
+  # the thin client and calls the memory API over the internal `memnet` network.
+  # Endpoint + bank live in hermes/hindsight-config.json → $HERMES_HOME/hindsight/config.json.
+  # The extractor LLM runs on the memory container, not here.
+  provider: hindsight
+  # Built-in MEMORY.md/USER.md off: facts live in Hindsight only, rules in the
+  # repo's instructions and skills. The files were bot-written, sat in every
+  # prompt and nobody reviewed them. Off also drops the `memory` tool and its
+  # background review; Hindsight's tools stay.
+  memory_enabled: false
+  user_profile_enabled: false
+
+# Your wall clock, for cron schedules (hermes evaluates cron expressions in
+# this zone, daylight saving included) and for the agent's idea of "now".
+# The container itself stays on UTC.
+timezone: "Europe/London"
+
+approvals:
+  # Risky tool calls wait for your confirmation in chat.
+  mode: manual
+  # Keep confirmations for /clear, /new, /reset, /undo (a stray /new disables them otherwise).
+  destructive_slash_confirm: true
+
+# Token budget. Every call resends the whole context, and long Telegram
+# sessions are where the tokens go.
+compression:
+  # An absolute trigger. hermes 0.21 raises any ratio threshold to 0.75 for
+  # windows under 512K, and one long task grew a session from 21K to 126K input
+  # per call. Compaction leaves ~45K (system prompt, summary, tail); a 64K
+  # trigger fired in most turns, each blocking the reply for 45-150 s, so 128K.
+  threshold_tokens: 128000
+
+auxiliary:
+  compression:
+    # The summary is a synchronous call inside the turn: a slow free model
+    # makes every compaction a long wait. A failed summary falls back to plain
+    # truncation.
+    provider: nous
+    model: "openai/gpt-6-luna"
+  vision:
+    # Left on auto, vision went to a free model that answered 429 most of the
+    # time. Point it at a model that reads images reliably.
+    provider: nous
+    model: "openai/gpt-6-sol"
+
+# No session_reset: hermes 0.21 ignores it. Time never ends a conversation,
+# so a Telegram thread runs until /new and compression above is what keeps
+# each call small.
+
+tools:
+  # Hide MCP tool schemas behind tool_search until a call needs them. In
+  # 0.21.5 "auto" is an alias of "on": the bridge turns on for any MCP tool.
+  # Core tools, browser_* included, are never deferred.
+  tool_search:
+    enabled: "on"
+    # Patched in (hermes/patches/tool_search_min_tokens.py): lighter surfaces
+    # stay direct. Only chat (tens of thousands of tokens of MCP tools) stays
+    # bridged; cron jobs pinned to one server see their tools directly and
+    # skip three discovery calls.
+    min_deferred_tokens: 20000
+
+plugins:
+  # Standalone plugins load only when listed; backends and platforms load anyway.
+  enabled:
+    - ticktick_untimed
+
+skills:
+  # Every skill write by the bot waits for you: /skills pending, /skills
+  # diff <id>, /skills approve <id>. Background skill review is off: with the
+  # gate on it would only fill the queue.
+  write_approval: true
+  creation_nudge_interval: 0
+
+cron:
+  # Deliver what the job actually said, with no "Cronjob Response: <name>" /
+  # job_id header and no "stop reminder" footer around it: messages are read
+  # on a phone.
+  wrap_response: false
+
+stt:
+  # Voice memo transcription (ffmpeg is already in the image). GROQ_API_KEY
+  # comes from the environment -> $HERMES_HOME/.env via the entrypoint.
+  enabled: true
+  echo_transcripts: true
+  provider: "groq"
+  # Auto-detect. hermes 0.21 defaults stt.language to "en", and Whisper with
+  # "en" on non-English speech returns an English translation instead of the
+  # original text.
+  language: ""
+
+mcp_servers:
+  ticktick:
+    # TickTick's own hosted server (Streamable HTTP). Static API token from
+    # Settings → Account → API Token, not OAuth: hermes' OAuth flow opens a
+    # browser on first connect and a headless server has none.
+    url: "https://mcp.ticktick.com/"
+    headers:
+      Authorization: "Bearer ${TICKTICK_API_TOKEN}"
+
+  gmail:
+    # gmail-mcp container. Google credentials live there, not here — this
+    # process never receives them. Streamable HTTP, not SSE (hermes issue
+    # #20349 drops the SSE session id).
+    url: "http://gmail-mcp:8000/mcp"
+
+  telegram:
+    # telegram-mcp container: the owner's own Telegram account. The session
+    # lives there; this process never receives it. Registered tools are
+    # whitelisted on top: what the telegram skill reads with, plus the send
+    # gate (each message confirmed on a button, allowlisted chats only), so a
+    # misannotated upstream tool still never reaches the agent, and fewer
+    # schemas reach the model. search_history searches the whole history
+    # (several words, dates, oldest first) and replaces upstream's
+    # search_messages; the alias tools remember whom the owner means by a
+    # first name; list_topics gives a forum topic's id for
+    # send_message_confirmed; download_media saves a message's photo or file
+    # under /shared/telegram.
+    url: "http://telegram-mcp:8000/mcp"
+    tools:
+      include:
+        - list_chats
+        - get_chat
+        - list_messages
+        - get_message_context
+        - list_topics
+        - search_history
+        - search_contacts
+        - get_direct_chat_by_contact
+        - transcribe_voice
+        - download_media
+        - set_contact_alias
+        - list_contact_aliases
+        - send_message_confirmed
+        - allow_chat
+        - disallow_chat
+        - list_allowed_chats
+
+  login-broker:
+    # Runs in its own container (see docker-compose.yml service `login-broker`)
+    # so `bw` and the vault master password are outside this agent's reach.
+    # Streamable HTTP, not SSE (hermes issue #20349 drops the SSE session id).
+    url: "http://login-broker:8000/mcp"
+
+platforms:
+  webhook:
+    # Voice commands from a private Alice (Yandex) skill, posted by
+    # alice-bridge. The entrypoint turns the platform on (WEBHOOK_ENABLED) and
+    # sets the HMAC secret (WEBHOOK_SECRET) only when ALICE_WEBHOOK_SECRET is
+    # present: the gateway reads this block without ${VAR} expansion. Port 8644
+    # is not published; only the compose network reaches it.
+    extra:
+      port: 8644
+      # Requests a minute, across routes.
+      rate_limit: 20
+      routes:
+        alice:
+          prompt: >-
+            Голосовая команда от владельца через Алису (текст распознан из речи,
+            без пунктуации, возможны ошибки распознавания): «{text}».
+            Выполни её. Ответ уйдёт в Telegram: начни его с «🎙 {text}»
+            на отдельной строке. Если команда непонятна, спроси в ответе,
+            что имелось в виду.
+          deliver: telegram
+
+browser:
+  # Headless Chromium sidecar (see docker-compose.yml service `chromium`).
+  # Reached by static IP, not service name: Chrome's DevTools HTTP endpoints
+  # reject a Host header that is not localhost or an IP. Hermes fetches
+  # /json/version here and connects to the returned browser websocket.
+  cdp_url: "http://172.28.0.10:9222"

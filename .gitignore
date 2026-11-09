@@ -1,0 +1,46 @@
+# Secrets — never commit
+.env
+.env.local
+*.pem
+*.key
+# Written by `python -m gmail_mcp.auth` (gmail-mcp/gmail_mcp/auth.py login())
+# into the working directory it's run from — a live Gmail refresh token.
+gmail-refresh-token.txt
+
+# Local state and caches
+logs/
+backups/
+*.db
+*.sqlite
+*.sqlite3
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Docker / runtime
+data/
+volumes/
+
+# Decrypted secrets — never commit
+.env
+secrets.dec.yaml
+
+# sops backup files
+*.sops.yaml.bak
+
+# Local DB / cache during dev
+.cache/
+data/
+
+*.egg-info/

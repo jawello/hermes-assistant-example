@@ -1,0 +1,25 @@
+[project]
+name = "alice-bridge"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "aiohttp>=3.9",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest-aiohttp>=1.0",
+]
+
+[project.scripts]
+alice-bridge = "alice_bridge.app:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["alice_bridge*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

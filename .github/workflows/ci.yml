@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OS tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck bats
+
+      - uses: astral-sh/setup-uv@v6
+
+      # Every check runs with dummy values; no secret is configured or needed.
+      - name: Checks
+        run: bash scripts/check.sh

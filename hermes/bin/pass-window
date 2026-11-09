@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""Where the next scheduled reading pass should start from.
+
+The gmail jobs run every hour from 09:00 to 23:00 and the telegram job once a
+morning. A fixed "last hour" or "last day" would lose whatever arrived while
+a pass was down and read some things twice after a slow run. Instead each pass
+reads from where the last *finished* pass of the same source started:
+
+    pass-window gmail start     # prints a Gmail query term, e.g. after:1758786400
+    pass-window telegram start  # prints since=2025-09-24T08:46:40Z date=2025-09-24
+    ... read, remember, report ...
+    pass-window <source> done   # only after the pass succeeded
+
+A pass that breaks before `done` leaves the checkpoint alone, so the next one
+covers what it missed. State: $HERMES_HOME/<source>/window.json.
+
+Invoked as `mail-window` (a symlink), the source is gmail: the mail jobs and
+the gmail skill predate this script and call it that way.
+"""
+import json
+import os
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+FIRST_LOOKBACK = 86400  # no checkpoint yet: the last day
+MAX_LOOKBACK = 7 * 86400  # after a long outage, a week is enough to catch up
+USAGE = "usage: pass-window gmail|telegram start|done"
+
+
+def gmail_term(since: int) -> str:
+    return f"after:{since}"
+
+
+def telegram_term(since: int) -> str:
+    # since is what the pass hands list_messages (patched to take an exact
+    # moment); date is the same day for tools that filter by a whole date.
+    # Both are UTC.
+    moment = datetime.fromtimestamp(since, timezone.utc)
+    return f"since={moment.strftime('%Y-%m-%dT%H:%M:%SZ')} date={moment.strftime('%Y-%m-%d')}"
+
+
+SOURCES = {"gmail": gmail_term, "telegram": telegram_term}
+
+
+def state_path(source: str) -> Path:
+    return Path(os.environ.get("HERMES_HOME", "/data/hermes")) / source / "window.json"
+
+
+def now() -> int:
+    override = os.environ.get("PASS_WINDOW_NOW") or os.environ.get("MAIL_WINDOW_NOW")
+    return int(override) if override else int(time.time())
+
+
+def load(path: Path) -> dict:
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def save(path: Path, state: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state), encoding="utf-8")
+    tmp.replace(path)
+
+
+def cmd_start(source: str, path: Path) -> int:
+    state = load(path)
+    current = now()
+    checked = state.get("checked")
+    since = checked if isinstance(checked, int) else current - FIRST_LOOKBACK
+    since = max(since, current - MAX_LOOKBACK)
+    # The pass is marked from the moment it started reading: anything arriving
+    # while it runs is after this point, so the next pass sees it.
+    state["pending"] = current
+    save(path, state)
+    print(SOURCES[source](since))
+    return 0
+
+
+def cmd_done(source: str, path: Path, prog: str) -> int:
+    state = load(path)
+    pending = state.pop("pending", None)
+    if not isinstance(pending, int):
+        print(f"{prog}: nothing to finish — run `{prog} start` first", file=sys.stderr)
+        return 1
+    state["checked"] = pending
+    save(path, state)
+    print("checkpoint saved")
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    prog = Path(argv[0]).name
+    args = argv[1:]
+    if prog == "mail-window":
+        args = ["gmail", *args]
+        shown = "mail-window"
+    else:
+        shown = f"pass-window {args[0]}" if args else "pass-window"
+    if len(args) != 2 or args[0] not in SOURCES or args[1] not in ("start", "done"):
+        print(USAGE, file=sys.stderr)
+        return 2
+    source, command = args
+    path = state_path(source)
+    if command == "start":
+        return cmd_start(source, path)
+    return cmd_done(source, path, shown)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

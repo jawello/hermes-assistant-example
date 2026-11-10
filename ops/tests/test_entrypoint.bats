@@ -382,16 +382,20 @@ STUB
   grep -qE '^timezone: "[A-Za-z_]+/[A-Za-z_]+"' hermes/config.yaml
 }
 
-@test "ensure_cron puts every job on the cheap cron model" {
+@test "ensure_cron puts hourly passes on the cron model and the morning reads on the digest model" {
   source hermes/entrypoint.sh
   stub_hermes
   set_job_model() { echo "model $*" >> "$HERMES_STUB_OUT/calls"; }
   PATH="$BIN_STUBS:$PATH" ensure_cron
-  for job in gmail-digest gmail-hourly suggestions telegram-digest telegram-hourly; do
+  for pair in "gmail-hourly:$CRON_MODEL" "telegram-hourly:$CRON_MODEL" \
+              "gmail-digest:$DIGEST_MODEL" "telegram-digest:$DIGEST_MODEL" \
+              "suggestions:$DIGEST_MODEL"; do
+    job="${pair%%:*}" model="${pair#*:}"
     create_line="$(grep -n "^cron create .*--name $job " "$HERMES_STUB_OUT/calls" | cut -d: -f1)"
-    model_line="$(grep -n "^model $job $CRON_MODEL\$" "$HERMES_STUB_OUT/calls" | cut -d: -f1)"
+    model_line="$(grep -n "^model $job $model\$" "$HERMES_STUB_OUT/calls" | cut -d: -f1)"
     [ -n "$model_line" ]
     [ "$create_line" -lt "$model_line" ]
+    [ "$(grep -c "^model $job " "$HERMES_STUB_OUT/calls")" -eq 1 ]
   done
   rm -rf "$BIN_STUBS" "$HERMES_STUB_OUT"
 }

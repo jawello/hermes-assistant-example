@@ -16,7 +16,7 @@ none of the strong credentials.
 | `vaultwarden` + `vault-cert-init` | credential vault (self-signed TLS, generated once) | vault (internal) |
 | `gmail-mcp` | Gmail: search, read, drafts, archive/trash; send and trash ask the owner to confirm | default |
 | `telegram-mcp` | the owner's Telegram user account (not the bot): reading, history search, a send gate with a confirm button and a chat allowlist | telegram |
-| `alice-bridge` | webhook for a Yandex Alice skill; answers Alice within its time limit and hands the phrase to hermes | default, edge |
+| `alice-bridge` | webhook for a Yandex Alice skill; answers Alice within its time limit and hands the phrase to hermes; speaks hermes' short answer on the Station through a Quasar cloud scenario (`/speak`) | default, edge |
 | `shared-janitor` | prunes the `/shared` exchange volume (mail attachments, downloaded media, outbox) | default |
 
 TickTick is the vendor's hosted MCP server, reached over HTTPS with a static

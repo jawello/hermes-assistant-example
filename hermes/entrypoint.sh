@@ -155,8 +155,11 @@ ensure_cron() {
     'Morning task suggestions. Run suggestions context first. Mark pending suggestions the owner already turned into a TickTick task as accepted. Check the open TickTick tasks and those completed in the last 30 days, propose at most three concrete tasks that are not already planned, done or offered, record each with suggestions add, then send the output of suggestions message verbatim. If nothing clears the bar, answer exactly [SILENT]. If suggestions context fails, say what broke instead. Never create, change, complete or delete anything; the only writes allowed are suggestions add and suggestions set-status. Follow the suggestions and ticktick skills — both are already loaded in full above; do not call skills_list or skill_view for them.' \
     >/dev/null
 
-  for job in gmail-digest gmail-hourly suggestions telegram-digest telegram-hourly; do
+  for job in gmail-hourly telegram-hourly; do
     set_job_model "$job" "$CRON_MODEL"
+  done
+  for job in gmail-digest telegram-digest suggestions; do
+    set_job_model "$job" "$DIGEST_MODEL"
   done
 
   # Each job reads untrusted text (mail, chats) with no one present to
@@ -172,9 +175,12 @@ ensure_cron() {
 }
 
 # Scheduled jobs read mail and TickTick and write short reports; they do not
-# need the chat model. GPT-6 Luna is the light model the linked ChatGPT plan
-# covers (see model: in config.yaml).
+# need the chat model. The hourly passes are mostly silent triage: GPT-6 Luna,
+# the light model the linked ChatGPT plan covers (see model: in config.yaml).
+# The morning digests and suggestions are what the user reads: GPT-6.1 Terra,
+# the plan's mid tier (1-2% of the weekly limit; spec 2026-11-08).
 CRON_MODEL="openai/gpt-6-luna"
+DIGEST_MODEL="openai/gpt-6.1-terra"
 
 # `hermes cron create` and `cron edit` take no --model; the job record does,
 # and the scheduler reads it on every tick. A failure leaves the job on the

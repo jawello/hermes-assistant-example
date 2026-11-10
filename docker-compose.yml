@@ -24,8 +24,11 @@ services:
       # default-empty keeps compose quiet and hermes must boot without it.
       ZENMONEY_TOKEN: ${ZENMONEY_TOKEN:-}
       # HMAC secret for the webhook alice-bridge posts voice commands to.
-      # Empty keeps the webhook platform off.
+      # Empty keeps the webhook platform off. The same secret signs hermes'
+      # requests back to alice-bridge's /speak (gateway/platforms/alice_speech.py).
       ALICE_WEBHOOK_SECRET: ${ALICE_WEBHOOK_SECRET:-}
+      # Where a voice turn's short answer goes to be spoken on the Station.
+      ALICE_SPEAK_URL: http://alice-bridge:8000/speak
     security_opt:
       - no-new-privileges:true
     networks:
@@ -413,6 +416,14 @@ services:
       ALICE_WEBHOOK_SECRET: ${ALICE_WEBHOOK_SECRET:-}
       ALICE_SKILL_ID: ${ALICE_SKILL_ID:-}
       ALICE_ALLOWED_USER_IDS: ${ALICE_ALLOWED_USER_IDS:-}
+      # Speech on the Station (quasar.py). The x_token is a credential for
+      # the user's whole Yandex account: it lives here only, never in hermes;
+      # see .env.example for how to get it. Empty: no speech.
+      YANDEX_X_TOKEN: ${YANDEX_X_TOKEN:-}
+      # Alice application_id of each Station -> its Quasar device id
+      # ("app=device,..."). Unmapped origins (the phone app) get no speech;
+      # the bridge logs their ids at INFO, which is how a Station is mapped.
+      ALICE_STATIONS: ${ALICE_STATIONS:-}
     security_opt:
       - no-new-privileges:true
     pids_limit: 128

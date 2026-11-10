@@ -1,7 +1,7 @@
 ---
 name: zenmoney
 description: Match a receipt (photo or text) to a bank-synced Zen-Money transaction and split it by budget category, or create a new transaction from a receipt. Use whenever a message contains a receipt, or mentions Zen-Money / Дзен-Мани / "разнеси чек" / "добавь в бюджет".
-version: 1.1.2
+version: 1.2.0
 platforms: [linux]
 metadata:
   hermes:
@@ -80,7 +80,8 @@ When asked to calculate someone's share of a restaurant/bar cheque
 - `zenmoney tags` — categories with full paths ("Разное → Подарки").
 - `zenmoney find --date YYYY-MM-DD --amount N [--payee STR] [--window DAYS]`
 - `zenmoney show TXID`
-- `zenmoney split TXID "Категория=сумма" ... [--comment STR]`
+- `zenmoney split TXID "Категория=сумма" ... [--share "Имя=сумма" ...]
+  [--comment STR]`
 - `zenmoney create --date YYYY-MM-DD --amount N --payee STR --tag STR
   [--account STR] [--comment STR]`
 
@@ -139,10 +140,17 @@ When asked to calculate someone's share of a restaurant/bar cheque
   title+path, the CLI exits with `ambiguous tag '...', candidates: ...`. The
   owner must delete the duplicate in the Zen-Money app (Настройки →
   Категории), then re-run `zenmoney sync`.
-- **CLI cannot create debt/loan transactions.** Only regular expense
-  transactions via `zenmoney create`. When a split includes a «дал в долг»
-  portion, split it into a temporary category (e.g. `Корректировка`) and ask
-  the owner to create the debt transaction manually in the app.
+- **Shared purchase: other people's shares become debts in the app.** The
+  CLI cannot create debt transactions; the owner converts shares in the app
+  («Я дал в долг» / «Мне дали в долг»). Split the bank payment with the
+  owner's own share first, categorized, and one `--share "Имя=сумма"` per
+  other person: `zenmoney split TXID "Продукты=40.00" --share "Ира=30.00"
+  --share "Олег=30.00" --comment "ужин"`. A share gets no category, the
+  person in `payee` and in the comment, whichever way the debt goes. Never
+  give a share a category, not even a temporary one like `Корректировка`: it
+  would count as the owner's expense. After the split, run `zenmoney show` on
+  every part and check `payee` and `tag` (null on a share); then tell the
+  owner which parts to convert to debts.
 - **`vision_analyze` can time out repeatedly — don't loop on it.** If it
   fails with "Request timed out" 2+ times, STOP retrying it. It is the vision
   backend, not the image. Report the outage and offer to retry later, or ask

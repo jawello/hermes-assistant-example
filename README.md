@@ -25,7 +25,8 @@ Read it for ideas; if you want to run it, see `docs/running.md`.
   headless Chromium.
 - **Sends messages and mail only on a button press**: every outgoing Telegram
   message and every sent email is confirmed by the owner.
-- **Takes voice commands** from a Yandex Alice skill.
+- **Takes voice commands** from a Yandex Alice skill and speaks a short
+  answer back on the Yandex Station; the full answer goes to Telegram.
 - **Remembers** through [Hindsight](https://github.com/vectorize-io/hindsight),
   a knowledge-graph memory, instead of a growing notes file.
 

@@ -14,10 +14,15 @@ model:
   # `nous`, OAuth stored on the volume by `hermes login`, so no API key here);
   # Portal model ids take no provider prefix.
   provider: nous
-  default: "openai/gpt-6-sol"
+  default: "openai/gpt-6.1-sol"
   # Compress before the price tier doubles: above 272K prompt tokens some
   # routes charge double or cap the window.
   context_length: 272000
+
+# Explicit, so the route does not depend on a server default. High is slower
+# on hard turns for little gain on short tool steps.
+agent:
+  reasoning_effort: medium
 
 # When the main model is refused — plan limit, HTTP 402 on credits, rate
 # limit or outage — try a lighter model, then a free one, instead of not
@@ -66,10 +71,11 @@ compression:
 auxiliary:
   compression:
     # The summary is a synchronous call inside the turn: a slow free model
-    # makes every compaction a long wait. A failed summary falls back to plain
-    # truncation.
+    # makes every compaction a long wait. The summary is what a long chat
+    # remembers, so it runs on a mid-tier model rather than the lightest one.
+    # A failed summary falls back to plain truncation.
     provider: nous
-    model: "openai/gpt-6-luna"
+    model: "openai/gpt-6.1-terra"
   vision:
     # Left on auto, vision went to a free model that answered 429 most of the
     # time. Point it at a model that reads images reliably.
@@ -174,6 +180,17 @@ mcp_servers:
     # Streamable HTTP, not SSE (hermes issue #20349 drops the SSE session id).
     url: "http://login-broker:8000/mcp"
 
+# Voice commands (the webhook platform) get the same tools as Telegram.
+# hermes' default for webhook is the narrow hermes-webhook set (web search,
+# vision, clarify: "webhook payloads are untrusted third-party content"), so
+# a voice command would have no terminal, skills, memory or browser. The only
+# route is alice, which alice-bridge authenticates (path secret, skill id,
+# HMAC). Confirmations still never happen in a voice turn (webhook is
+# unattended in hermes): dangerous commands are denied, sends go through a
+# draft in Telegram.
+platform_toolsets:
+  webhook: [hermes-telegram]
+
 platforms:
   webhook:
     # Voice commands from a private Alice (Yandex) skill, posted by
@@ -190,10 +207,41 @@ platforms:
           prompt: >-
             Голосовая команда от владельца через Алису (текст распознан из речи,
             без пунктуации, возможны ошибки распознавания): «{text}».
-            Выполни её. Ответ уйдёт в Telegram: начни его с «🎙 {text}»
-            на отдельной строке. Если команда непонятна, спроси в ответе,
-            что имелось в виду.
+            Выполни её. Команда обращена к тебе: «спроси», «узнай»,
+            «скажи», «попроси» в её начале значат, что это нужно сделать
+            тебе, — выполни то, что после них, а не переспрашивай владельца;
+            слова-заполнители («так», «а теперь», «ну») пропусти. Ответ
+            уйдёт в Telegram: начни его с «🎙 {text}»
+            на отдельной строке. Последней строкой ответа напиши «🔊 » и
+            фразу, которую Станция скажет вслух: по-русски, не длиннее 100
+            символов, без ссылок, эмодзи и форматирования. На вопрос — сам
+            ответ («Задача стоит на субботу, седьмое ноября.»); на список —
+            сколько пунктов и главные, затем «остальное в Телеграме»; на
+            действие — короткое подтверждение («Готово, ссылка в
+            Телеграме.»); если сделать не получилось — коротко, что не
+            вышло («Не получилось найти письмо, подробности в
+            Телеграме.»). В этом ходе ничего не отправляй и не делай того,
+            что требует подтверждения владельца (сообщения, письма, всё, что
+            спрашивает подтверждение): подготовь черновик, покажи его в
+            ответе, попроси подтвердить в Telegram и закончи строкой
+            «🔊 Черновик готов, подтверди в Телеграме.». Если команда
+            непонятна, спроси в ответе, что имелось в виду, и закончи
+            строкой «🔊 Нужно уточнение, смотри Телеграм.».
           deliver: telegram
+          # alice-bridge puts the Station's Quasar device id in the payload's
+          # `speaker` ("" for the phone app or an unknown device). speak_on opts
+          # the route into gateway/platforms/alice_speech.py (patched in by
+          # hermes/patches/webhook_speak.py): the 🔊 line is spoken on that
+          # Station and removed from the Telegram message.
+          deliver_extra:
+            speak_on: "{speaker}"
+          # A voice turn cannot get a confirmation: hermes treats webhook
+          # sessions as unattended (tools/approval_context.py,
+          # _is_gateway_approval_context), so send gates decline at once. The
+          # answer is mirrored into the Telegram chat's transcript instead, and
+          # the owner's «отправляй» there is an ordinary Telegram turn with the
+          # usual button.
+          mirror_to_session: true
 
 browser:
   # Headless Chromium sidecar (see docker-compose.yml service `chromium`).

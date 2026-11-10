@@ -107,3 +107,59 @@ def test_original_currency_untouched_when_same_currency(st, client, fake_zen):
     for part in fake_zen.requests[0]["transaction"]:
         assert part["opOutcome"] == 0
         assert part["opOutcomeInstrument"] is None
+
+
+# Shares: other people's parts of a shared purchase, left without a category
+# so the user can convert each into a debt in the app (2026-11-07).
+SHARES = [("Маша", Decimal("30.74")), ("Петя", Decimal("27.73"))]
+
+
+def test_shares_are_uncategorized_parts_named_for_the_person(st, client,
+                                                             fake_zen):
+    result = ops.split(client, st, "t1", [("Еда", Decimal("80.21"))],
+                       shares=SHARES, comment="ужин")
+    sent = fake_zen.requests[0]["transaction"]
+    assert len(fake_zen.requests) == 1 and len(sent) == 3
+    original, masha, petya = sent
+    assert original["id"] == "t1" and original["tag"] == ["food"]
+    assert original["payee"] == "Supermarket"
+    assert original["comment"] == "ужин"
+    for part, name in ((masha, "Маша"), (petya, "Петя")):
+        assert part["tag"] is None
+        assert part["payee"] == name
+        assert part["merchant"] is None and part["originalPayee"] is None
+        assert part["comment"] == f"{name} — ужин"
+        assert part["outcomeBankID"] is None
+    assert [p["tag"] for p in result["parts"]] == ["Еда", None, None]
+    assert [p["payee"] for p in result["parts"]] == ["Supermarket", "Маша", "Петя"]
+
+
+def test_share_comment_is_the_name_alone_without_comment(st, client, fake_zen):
+    ops.split(client, st, "t1", [("Еда", Decimal("80.21"))], shares=SHARES)
+    assert fake_zen.requests[0]["transaction"][1]["comment"] == "Маша"
+
+
+def test_shares_count_toward_the_sum(st, client):
+    with pytest.raises(ValueError, match="138.68"):
+        ops.split(client, st, "t1", [("Еда", Decimal("80.21"))],
+                  shares=[("Маша", Decimal("1.00"))])
+
+
+def test_one_category_and_one_share_is_a_split(st, client, fake_zen):
+    ops.split(client, st, "t1", [("Еда", Decimal("100.00"))],
+              shares=[("Маша", Decimal("38.68"))])
+    assert len(fake_zen.requests[0]["transaction"]) == 2
+
+
+def test_shares_need_a_categorized_part_first(st, client, fake_zen):
+    with pytest.raises(ValueError, match="categor"):
+        ops.split(client, st, "t1", [], shares=[("Маша", Decimal("138.68"))])
+    assert fake_zen.requests == []
+
+
+def test_shares_divide_the_original_currency_too(st, client, fake_zen):
+    st.entities["transaction"]["t1"].update(
+        opOutcome=100.0, opOutcomeInstrument=2)
+    ops.split(client, st, "t1", [("Еда", Decimal("80.21"))], shares=SHARES)
+    sent = fake_zen.requests[0]["transaction"]
+    assert sum(Decimal(str(t["opOutcome"])) for t in sent) == Decimal("100.00")

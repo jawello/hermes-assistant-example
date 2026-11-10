@@ -116,15 +116,28 @@ def _split_original_currency(tx: dict, amounts: list[Decimal],
 
 def split(client: ZenMoneyClient, state: State, tx_id: str,
           parts: list[tuple[str, Decimal]],
-          comment: str | None = None) -> dict:
+          comment: str | None = None,
+          shares: list[tuple[str, Decimal]] | None = None) -> dict:
+    """Split a bank payment into categorized parts and other people's shares.
+
+    A share is someone else's part of a shared purchase: no category, the
+    person in `payee`, so the user can convert it into a debt in the app. The
+    first categorized part stays the bank's own transaction.
+    """
+    shares = shares or []
+    if not parts:
+        raise ValueError("split needs a categorized part first (the user's "
+                         "own share); shares come after it")
     tx = state.entities["transaction"].get(tx_id)
     if tx is None or tx.get("deleted"):
         raise ValueError(f"no transaction {tx_id!r} in local state (run sync?)")
     if tx.get("income", 0):
         raise ValueError("refusing to split: transaction has an income side")
-    if len(parts) < 2:
+    if len(parts) + len(shares) < 2:
         raise ValueError("split needs at least 2 parts")
-    amounts = [Decimal(a).quantize(CENT) for _, a in parts]
+    if any(not name.strip() for name, _ in shares):
+        raise ValueError("every share needs a person's name")
+    amounts = [Decimal(a).quantize(CENT) for _, a in parts + shares]
     if any(a <= 0 for a in amounts):
         raise ValueError("every part must be > 0")
     outcome = Decimal(str(tx["outcome"])).quantize(CENT)
@@ -132,6 +145,9 @@ def split(client: ZenMoneyClient, state: State, tx_id: str,
         raise ValueError(
             f"parts sum {sum(amounts)} != transaction outcome {outcome}")
     tag_ids = [resolve_tag(state, name) for name, _ in parts]
+    # A share has no category, and its payee is the person, not the shop.
+    tag_ids += [None] * len(shares)
+    payees = [None] * len(parts) + [name.strip() for name, _ in shares]
 
     op_shares = _split_original_currency(tx, amounts, outcome)
 
@@ -144,11 +160,15 @@ def split(client: ZenMoneyClient, state: State, tx_id: str,
     if comment:
         modified["comment"] = comment
     batch = [modified]
-    for tag_id, amount, op in zip(tag_ids[1:], amounts[1:], op_shares[1:]):
+    for tag_id, payee, amount, op in zip(tag_ids[1:], payees[1:], amounts[1:],
+                                         op_shares[1:]):
         part = dict(tx, **PART_RESET)
         part.update(id=str(uuid.uuid4()), created=now, changed=now,
                     deleted=False, viewed=True, outcome=float(amount),
-                    tag=[tag_id], comment=comment)
+                    tag=[tag_id] if tag_id else None, comment=comment)
+        if payee:
+            part.update(payee=payee, merchant=None, originalPayee=None,
+                        comment=f"{payee} — {comment}" if comment else payee)
         if op is not None:
             part["opOutcome"] = float(op)
         batch.append(part)
@@ -162,8 +182,10 @@ def split(client: ZenMoneyClient, state: State, tx_id: str,
     state.entities["transaction"][tx_id] = modified
     state.save()
     return {"ok": True, "original": tx_id,
-            "parts": [{"id": b["id"], "tag": tag_path(state, b["tag"][0]),
-                       "amount": b["outcome"]} for b in batch]}
+            "parts": [{"id": b["id"],
+                       "tag": tag_path(state, b["tag"][0]) if b["tag"] else None,
+                       "payee": b.get("payee"), "amount": b["outcome"]}
+                      for b in batch]}
 
 
 def _pick_account(state: State, account: str | None) -> dict:

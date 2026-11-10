@@ -3,11 +3,13 @@ import hashlib
 import hmac
 import json
 import logging
+import time
 
 import pytest
 from aiohttp import web
 
-from alice_bridge.app import ASK, FAILED, HELP, Config, configure_logging, make_app
+from alice_bridge.quasar import Speech
+from alice_bridge.app import ASK, FAILED, HELP, Config, configure_logging, make_app, parse_stations
 
 PATH_SECRET = "path-secret-value"
 WEBHOOK_SECRET = "webhook-secret-value"
@@ -16,12 +18,13 @@ USER = "user-1"
 
 
 def alice(command="купить молоко", *, skill=SKILL, user=USER, new=True,
-          utterance=None, session_id="s1", message_id=0):
+          utterance=None, session_id="s1", message_id=0, application_id="app-1",
+          client_id="ru.yandex.quasar.app/1.0"):
     return {
-        "meta": {"locale": "ru-RU"},
+        "meta": {"locale": "ru-RU", "client_id": client_id},
         "session": {"new": new, "session_id": session_id, "message_id": message_id,
                     "skill_id": skill, "user": {"user_id": user},
-                    "application": {"application_id": "app-1"}},
+                    "application": {"application_id": application_id}},
         "request": {"command": command,
                     "original_utterance": command if utterance is None else utterance,
                     "type": "SimpleUtterance"},
@@ -49,12 +52,12 @@ def hermes():
 async def client(aiohttp_client, aiohttp_server, hermes):
     server = await aiohttp_server(hermes["app"])
 
-    async def make(**overrides):
+    async def make(speaker_factory=None, **overrides):
         cfg = dict(path_secret=PATH_SECRET, webhook_secret=WEBHOOK_SECRET, skill_id=SKILL,
                    allowed_user_ids=frozenset(),
                    hermes_url=str(server.make_url("/webhooks/alice")))
         cfg.update(overrides)
-        return await aiohttp_client(make_app(Config(**cfg)))
+        return await aiohttp_client(make_app(Config(**cfg), speaker_factory=speaker_factory))
     return make
 
 
@@ -67,11 +70,16 @@ async def test_forwards_signed_phrase_and_echoes_it(client, hermes):
     resp = await post(c, alice())
     assert resp.status == 200
     data = await resp.json()
-    assert data["response"] == {"text": "Передал: купить молоко", "end_session": True}
+    # The skill stays open: the Station listens again and the next command
+    # needs neither «Алиса» nor the skill's name.
+    assert data["response"] == {"text": "Передал: купить молоко", "end_session": False}
     [call] = hermes["calls"]
-    assert json.loads(call["body"]) == {"text": "купить молоко", "source": "alice"}
-    expected = hmac.new(WEBHOOK_SECRET.encode(), call["body"], hashlib.sha256).hexdigest()
-    assert call["headers"]["X-Webhook-Signature"] == expected
+    assert json.loads(call["body"]) == {"text": "купить молоко", "source": "alice", "speaker": ""}
+    ts = call["headers"]["X-Webhook-Timestamp"]
+    assert abs(int(ts) - time.time()) < 5
+    expected = hmac.new(WEBHOOK_SECRET.encode(), ts.encode() + b"." + call["body"], hashlib.sha256).hexdigest()
+    assert call["headers"]["X-Webhook-Signature-V2"] == expected
+    assert "X-Webhook-Signature" not in call["headers"]  # no replayable body-only V1
     assert call["headers"]["X-Request-ID"] == "alice:s1:0"
 
 
@@ -93,7 +101,7 @@ async def test_hermes_error_is_reported(client, hermes, status):
     hermes["status"] = status
     c = await client()
     data = await (await post(c, alice())).json()
-    assert data["response"]["text"] == FAILED
+    assert data["response"] == {"text": FAILED, "end_session": True}
 
 
 async def test_hermes_timeout_is_reported_in_time(client, hermes, monkeypatch):
@@ -103,14 +111,14 @@ async def test_hermes_timeout_is_reported_in_time(client, hermes, monkeypatch):
     loop = asyncio.get_running_loop()
     started = loop.time()
     data = await (await post(c, alice())).json()
-    assert data["response"]["text"] == FAILED
+    assert data["response"] == {"text": FAILED, "end_session": True}
     assert loop.time() - started < 0.9
 
 
 async def test_hermes_unreachable_is_reported(client):
     c = await client(hermes_url="http://127.0.0.1:1/webhooks/alice")
     data = await (await post(c, alice())).json()
-    assert data["response"]["text"] == FAILED
+    assert data["response"] == {"text": FAILED, "end_session": True}
 
 
 async def test_wrong_path_secret_is_404(client, hermes):
@@ -203,3 +211,155 @@ async def test_secrets_and_utterance_never_logged_at_info(client, hermes, caplog
     text = caplog.text
     for secret in (PATH_SECRET, WEBHOOK_SECRET, "купить молоко"):
         assert secret not in text
+
+
+async def test_station_origin_is_forwarded_as_speaker(client, hermes):
+    c = await client(stations={"app-station": "dev-1"})
+    await post(c, alice(application_id="app-station"))
+    assert json.loads(hermes["calls"][0]["body"])["speaker"] == "dev-1"
+
+
+async def test_unmapped_origin_has_empty_speaker_and_logs_ids(client, hermes, caplog):
+    caplog.set_level(logging.INFO)
+    c = await client(stations={"app-station": "dev-1"})
+    await post(c, alice(application_id="app-phone", client_id="ru.yandex.searchplugin/1.0"))
+    assert json.loads(hermes["calls"][0]["body"])["speaker"] == ""
+    assert "app-phone" in caplog.text
+    assert "ru.yandex.searchplugin/1.0" in caplog.text
+
+
+def test_stations_env_parsing():
+    assert parse_stations("a=d1, b=d2,") == {"a": "d1", "b": "d2"}
+    assert parse_stations("") == {}
+
+
+class FakeSpeaker:
+    def __init__(self, result=Speech.OK):
+        self.said, self.started, self.result = [], 0, result
+
+    async def start(self):
+        self.started += 1
+        return Speech.OK
+
+    async def say(self, device_id, text):
+        self.said.append((device_id, text))
+        return self.result
+
+
+@pytest.fixture
+def fake_speaker():
+    speaker = FakeSpeaker()
+    tokens = []
+
+    def factory(http, x_token):
+        tokens.append(x_token)
+        return speaker
+    speaker.tokens = tokens
+    speaker.factory = factory
+    return speaker
+
+
+def speak_headers(raw, *, secret=WEBHOOK_SECRET, ts=None, signature=None):
+    ts = str(int(time.time())) if ts is None else ts
+    sig = signature if signature is not None else hmac.new(
+        secret.encode(), b"speak." + ts.encode() + b"." + raw, hashlib.sha256).hexdigest()
+    return {"X-Speak-Timestamp": ts, "X-Speak-Signature": sig, "Content-Type": "application/json"}
+
+
+async def speak(c, body, **kw):
+    raw = json.dumps(body, ensure_ascii=False).encode()
+    return await c.post("/speak", data=raw, headers=speak_headers(raw, **kw))
+
+
+async def test_speak_requires_signature(client, fake_speaker):
+    c = await client(speaker_factory=fake_speaker.factory, x_token="tok")
+    assert (await speak(c, {"speaker": "dev-1", "text": "Привет"}, secret="wrong")).status == 401
+    assert (await speak(c, {"speaker": "dev-1", "text": "Привет"}, signature="")).status == 401
+    assert fake_speaker.said == []
+
+
+async def test_speak_passes_text_to_speaker(client, fake_speaker):
+    c = await client(speaker_factory=fake_speaker.factory, x_token="tok")
+    resp = await speak(c, {"speaker": "dev-1", "text": "Привет"})
+    assert resp.status == 200
+    assert await resp.json() == {"result": "ok"}
+    assert fake_speaker.said == [("dev-1", "Привет")]
+    assert fake_speaker.tokens == ["tok"] and fake_speaker.started == 1
+
+
+async def test_speak_queues_a_phrase_while_the_station_speaks(client, fake_speaker):
+    c = await client(speaker_factory=fake_speaker.factory, x_token="tok")
+    await speak(c, {"speaker": "dev-1", "text": "Первый"})
+    assert await (await speak(c, {"speaker": "dev-1", "text": "Второй"})).json() == {"result": "queued"}
+    assert fake_speaker.said == [("dev-1", "Первый")]
+
+
+async def test_speak_reports_speaker_result(client, fake_speaker):
+    fake_speaker.result = Speech.AUTH_LOST
+    c = await client(speaker_factory=fake_speaker.factory, x_token="tok")
+    assert await (await speak(c, {"speaker": "dev-1", "text": "Привет"})).json() == {"result": "auth_lost"}
+
+
+@pytest.mark.parametrize("body", [{"speaker": "dev-1", "text": "я" * 101}, {"speaker": "", "text": "Привет"},
+                                  {"speaker": "dev-1", "text": ""}, ["not", "a", "dict"]])
+async def test_speak_rejects_bad_body(client, fake_speaker, body):
+    c = await client(speaker_factory=fake_speaker.factory, x_token="tok")
+    assert (await speak(c, body)).status == 400
+    assert fake_speaker.said == []
+
+
+async def test_speak_accepts_100_chars(client, fake_speaker):
+    c = await client(speaker_factory=fake_speaker.factory, x_token="tok")
+    assert (await speak(c, {"speaker": "dev-1", "text": "я" * 100})).status == 200
+
+
+async def test_speak_without_token_is_not_configured(client, fake_speaker):
+    c = await client(speaker_factory=fake_speaker.factory)
+    assert await (await speak(c, {"speaker": "dev-1", "text": "Привет"})).json() == {"result": "not_configured"}
+    assert fake_speaker.tokens == []
+
+
+async def test_speak_result_is_logged_without_text(client, fake_speaker, caplog):
+    configure_logging()
+    caplog.set_level(logging.INFO)
+    c = await client(speaker_factory=fake_speaker.factory, x_token="tok")
+    await speak(c, {"speaker": "dev-1", "text": "секретная фраза"})
+    assert "spoke on dev-1: ok" in caplog.text
+    assert "секретная фраза" not in caplog.text and "tok" not in caplog.text.replace("token", "")
+
+
+async def test_speak_rejects_a_forward_style_signature(client, fake_speaker):
+    c = await client(speaker_factory=fake_speaker.factory, x_token="tok")
+    raw = json.dumps({"speaker": "dev-1", "text": "Привет"}).encode()
+    ts = str(int(time.time()))
+    v2 = hmac.new(WEBHOOK_SECRET.encode(), ts.encode() + b"." + raw, hashlib.sha256).hexdigest()
+    resp = await c.post("/speak", data=raw, headers={"X-Speak-Timestamp": ts, "X-Speak-Signature": v2})
+    assert resp.status == 401
+    v1 = hmac.new(WEBHOOK_SECRET.encode(), raw, hashlib.sha256).hexdigest()
+    assert (await c.post("/speak", data=raw, headers={"X-Webhook-Signature": v1})).status == 401
+    assert fake_speaker.said == []
+
+
+async def test_speak_rejects_a_stale_timestamp(client, fake_speaker):
+    c = await client(speaker_factory=fake_speaker.factory, x_token="tok")
+    old = str(int(time.time()) - 301)
+    assert (await speak(c, {"speaker": "dev-1", "text": "Привет"}, ts=old)).status == 401
+    assert (await speak(c, {"speaker": "dev-1", "text": "Привет"}, ts="soon")).status == 401
+    assert fake_speaker.said == []
+
+
+async def test_speak_rejects_a_replayed_request(client, fake_speaker):
+    c = await client(speaker_factory=fake_speaker.factory, x_token="tok")
+    raw = json.dumps({"speaker": "dev-1", "text": "Привет"}).encode()
+    headers = speak_headers(raw)
+    assert (await c.post("/speak", data=raw, headers=headers)).status == 200
+    assert (await c.post("/speak", data=raw, headers=headers)).status == 401
+    assert fake_speaker.said == [("dev-1", "Привет")]
+
+
+async def test_speak_non_ascii_signature_is_401(client, fake_speaker):
+    c = await client(speaker_factory=fake_speaker.factory, x_token="tok")
+    raw = json.dumps({"speaker": "dev-1", "text": "Привет"}).encode()
+    headers = speak_headers(raw, signature="подпись")
+    headers = {k: v.encode("utf-8").decode("latin-1") for k, v in headers.items()}
+    assert (await c.post("/speak", data=raw, headers=headers)).status == 401

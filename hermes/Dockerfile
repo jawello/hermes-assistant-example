@@ -138,6 +138,14 @@ RUN python /tmp/hindsight_prefetch_timeout.py "${HERMES_SRC}" && rm /tmp/hindsig
 COPY hermes/patches/skill_diff_batch.py /tmp/skill_diff_batch.py
 RUN python /tmp/skill_diff_batch.py "${HERMES_SRC}" && rm /tmp/skill_diff_batch.py
 
+# A voice turn's 🔊 line is spoken on the Station (via alice-bridge /speak)
+# before the rest goes to Telegram (2026-11-08). The runtime module lives next
+# to the webhook platform; the patch calls it from send() and fails the build
+# on a shape change.
+COPY hermes/patches/alice_speech.py ${HERMES_SRC}/gateway/platforms/alice_speech.py
+COPY hermes/patches/webhook_speak.py /tmp/webhook_speak.py
+RUN python /tmp/webhook_speak.py "${HERMES_SRC}" && rm /tmp/webhook_speak.py
+
 # Bundled, like the hindsight provider, so it lives in the image and not on the
 # data volume. It rewrites a TickTick date with no time into an all-day task.
 COPY hermes/plugins/ticktick_untimed ${HERMES_SRC}/plugins/ticktick_untimed

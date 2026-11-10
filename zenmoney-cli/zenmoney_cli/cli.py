@@ -45,7 +45,14 @@ def main(argv=None) -> int:
     s.add_argument("txid")
     sp = sub.add_parser("split")
     sp.add_argument("txid")
-    sp.add_argument("parts", nargs="+")
+    sp.add_argument("parts", nargs="+", metavar="Категория=12.34",
+                    help="categorized parts; the first stays the bank's "
+                         "transaction (the user's own share)")
+    sp.add_argument("--share", action="append", default=[],
+                    metavar="Имя=12.34",
+                    help="another person's share: no category, payee = the "
+                         "person, for the user to convert into a debt; repeat "
+                         "per person")
     sp.add_argument("--comment")
     c = sub.add_parser("create")
     c.add_argument("--date", required=True)
@@ -85,8 +92,10 @@ def main(argv=None) -> int:
         if args.cmd == "split":
             parts = [(n, Decimal(a))
                      for n, a in (parse_part(raw) for raw in args.parts)]
+            shares = [(n, Decimal(a))
+                      for n, a in (parse_part(raw) for raw in args.share)]
             return emit(ops.split(client, state, args.txid, parts,
-                                  comment=args.comment))
+                                  comment=args.comment, shares=shares))
         if args.cmd == "create":
             return emit(ops.create(client, state, args.date,
                                    Decimal(args.amount), args.payee, args.tag,

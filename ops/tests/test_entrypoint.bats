@@ -153,6 +153,34 @@ teardown() {
   grep -q "new body" "$HERMES_HOME/skills/personal/zenmoney/SKILL.md"
 }
 
+@test "repo_skill_names lists frontmatter names, falling back to the directory" {
+  source hermes/entrypoint.sh
+  mkdir -p "$DEFAULTS_DIR/skills/personal/zenmoney" "$DEFAULTS_DIR/skills/cyprus/cyta"
+  printf -- '---\nname: zenmoney\nversion: 1\n---\n' > "$DEFAULTS_DIR/skills/personal/zenmoney/SKILL.md"
+  printf -- '---\nversion: 1\n---\n' > "$DEFAULTS_DIR/skills/cyprus/cyta/SKILL.md"
+  [ "$(repo_skill_names)" = "$(printf 'cyta\nzenmoney')" ]
+}
+
+@test "pin_repo_skills passes every repo skill to hermes and only warns on failure" {
+  source hermes/entrypoint.sh
+  mkdir -p "$DEFAULTS_DIR/skills/personal/zenmoney" "$DEFAULTS_DIR/skills/cyprus/cyta"
+  printf -- '---\nname: zenmoney\n---\n' > "$DEFAULTS_DIR/skills/personal/zenmoney/SKILL.md"
+  printf -- '---\nname: cyta\n---\n' > "$DEFAULTS_DIR/skills/cyprus/cyta/SKILL.md"
+  stubs="$(mktemp -d)"
+  printf '#!/bin/sh\necho "$@" > "%s/args"\ncat > "%s/script"\nexit 1\n' "$stubs" "$stubs" > "$stubs/python3"
+  chmod +x "$stubs/python3"
+  PATH="$stubs:$PATH" run bash -euo pipefail -c 'source hermes/entrypoint.sh; pin_repo_skills'
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"repo skills stay unpinned"* ]]
+  [ "$(cat "$stubs/args")" = "- cyta zenmoney" ]
+  grep -q 'set_pinned(name, True)' "$stubs/script"
+  rm -rf "$stubs"
+}
+
+@test "main pins repo skills right after seeding them" {
+  grep -A1 '^  seed_skills$' hermes/entrypoint.sh | grep -qx '  pin_repo_skills'
+}
+
 @test "seed_skills keeps volume edits when versions are equal" {
   source hermes/entrypoint.sh
   mkdir -p "$DEFAULTS_DIR/skills/personal/zenmoney"

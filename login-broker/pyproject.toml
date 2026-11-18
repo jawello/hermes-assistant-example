@@ -7,7 +7,6 @@ dependencies = [
     # written against it. <3 keeps the next major from arriving on a rebuild.
     "mcp>=2.3,<3",
     "playwright>=1.45",
-    "pyotp>=2.9",
 ]
 
 [project.optional-dependencies]

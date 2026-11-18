@@ -19,10 +19,10 @@ model:
   # routes charge double or cap the window.
   context_length: 272000
 
-# Explicit, so the route does not depend on a server default. High is slower
-# on hard turns for little gain on short tool steps.
+# Explicit, so the route does not depend on a server default. High costs
+# latency, but on a plan whose limit tracks input tokens it barely moves usage.
 agent:
-  reasoning_effort: medium
+  reasoning_effort: high
 
 # When the main model is refused — plan limit, HTTP 402 on credits, rate
 # limit or outage — try a lighter model, then a free one, instead of not
@@ -109,6 +109,15 @@ skills:
   # gate on it would only fill the queue.
   write_approval: true
   creation_nudge_interval: 0
+
+curator:
+  # Off: no skill is archived automatically. The repo's skills are pinned at
+  # start (entrypoint pin_repo_skills); archive the bot's own unused skills by
+  # hand with `hermes curator archive <name>`. With it on, the curator archives
+  # any skill unused for 30 days, repo skills included.
+  enabled: false
+  stale_after_days: 60
+  archive_after_days: 90
 
 cron:
   # Deliver what the job actually said, with no "Cronjob Response: <name>" /

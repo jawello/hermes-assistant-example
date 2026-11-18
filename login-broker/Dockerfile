@@ -3,8 +3,10 @@ FROM python:3.12-slim@sha256:02108f5d322dd89f1c9e552442c25acb0543dfdbc455693a559
 # nodejs/npm: the Bitwarden CLI. ca-certificates: TLS to Vaultwarden.
 # The Playwright python package ships its own node driver; it connects to a
 # remote Chromium over CDP, so no browser binary is downloaded here.
+# libatomic1: Playwright 1.65's bundled node needs libatomic.so.1, which the
+# slim base lacks; without it every browser_login failed (2026-11-16).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates nodejs npm \
+        ca-certificates nodejs npm libatomic1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Pinned deliberately, and only in step with Vaultwarden (docker-compose.yml):
@@ -16,7 +18,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN npm install -g @bitwarden/cli@2026.9.1
 
 COPY . /opt/login-broker
-RUN pip install --no-cache-dir /opt/login-broker
+RUN pip install --no-cache-dir /opt/login-broker \
+    # Fail the build, not the first login, if the bundled driver cannot start.
+    && python -m playwright --version
 
 EXPOSE 8000
 

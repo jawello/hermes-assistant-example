@@ -84,6 +84,44 @@ seed_skills() {
   done < <(find "$src" -mindepth 2 -maxdepth 2 -type d)
 }
 
+# Names of the skills the image ships, one per line (frontmatter `name:`,
+# else the directory name).
+repo_skill_names() {
+  local src="$DEFAULTS_DIR/skills" skill_dir name
+  [ -d "$src" ] || return 0
+  while IFS= read -r skill_dir; do
+    name="$(sed -n 's/^name:[[:space:]]*//p' "$skill_dir/SKILL.md" 2>/dev/null | head -n1)"
+    printf '%s\n' "${name:-$(basename "$skill_dir")}"
+  done < <(find "$src" -mindepth 2 -maxdepth 2 -type d | sort)
+}
+
+# The curator archives any agent-created skill unused for 30 days, and the
+# repo's skills count as agent-created. seed_skills then copies an archived one
+# back on the next start, while its usage record stays "archived" and the
+# ledger files an empty TickTick task (2026-11-10: cyprus-shipping,
+# cyprus-trip-planning, secondhand-listings). A skill in the repo is kept on
+# purpose, so pin it; a pinned skill is never auto-transitioned. One seeded back
+# after an archive is marked active again. The bot's own skills stay under the
+# curator. A failure leaves them unpinned, as before, so it only warns.
+pin_repo_skills() {
+  local names
+  names="$(repo_skill_names)"
+  [ -n "$names" ] || return 0
+  # shellcheck disable=SC2086
+  python3 - $names <<'PY' || echo "warning: repo skills stay unpinned" >&2
+import sys
+from tools import skill_usage as u
+for name in sys.argv[1:]:
+    if not u.is_agent_created(name):
+        continue
+    if not u.set_pinned(name, True):
+        print(f"warning: could not pin skill {name}", file=sys.stderr)
+        continue
+    if u.get_record(name).get("state") != u.STATE_ACTIVE:
+        u.set_state(name, u.STATE_ACTIVE)
+PY
+}
+
 # The scheduled passes, as code: mail, Telegram and morning suggestions. The
 # scheduler ticker runs inside `hermes gateway run`, so no host cron is involved.
 # The schedule and prompts below are an example; tune them to your own day.
@@ -216,6 +254,7 @@ main() {
   write_env_file
   sync_config
   seed_skills
+  pin_repo_skills
   ensure_cron
   exec hermes gateway run
 }

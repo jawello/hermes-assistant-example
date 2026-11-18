@@ -1,7 +1,7 @@
 ---
 name: zenmoney
 description: Match a receipt (photo or text) to a bank-synced Zen-Money transaction and split it by budget category, or create a new transaction from a receipt. Use whenever a message contains a receipt, or mentions Zen-Money / Дзен-Мани / "разнеси чек" / "добавь в бюджет".
-version: 1.2.0
+version: 1.3.0
 platforms: [linux]
 metadata:
   hermes:
@@ -56,6 +56,9 @@ prints one JSON object. On error it prints `{"ok": false, "error": ...}`.
 8. **No synced transaction found** (e.g. cash): propose
    `zenmoney create --date ... --amount ... --payee ... --tag "Продукты"`
    instead — also confirm-first.
+9. **Do not retain receipts after processing.** If a receipt was uploaded to
+   Drive or placed in `_unsorted` only for categorization, trash it after the
+   budget work is complete, unless the user explicitly asks to keep it.
 
 ### Splitting a bill among people
 
